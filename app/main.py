@@ -610,3 +610,486 @@ def regularize_attendance(
     return format_attendance_record(updated)
 
 
+@app.get("/analytics/employees/{emp_code}/monthly", tags=["analytics"])
+def employee_monthly(
+    emp_code: Annotated[str, Path()],
+    month: Annotated[str, Query(pattern=r"^\d{4}-(0[1-9]|1[0-2])$")]
+):
+    """Monthly attendance summary for one employee."""
+    emp = db.employees.find_one({"emp_code": emp_code})
+    if not emp:
+        raise HTTPException(status_code=404, detail="Employee not found")
+
+    start_date, end_date, _ = get_month_days_range(month)
+    working_days = get_working_days_count(month, emp["joined_on"])
+
+    cursor = db.attendance_logs.find({
+        "emp_code": emp_code,
+        "date": {"$gte": start_date, "$lte": end_date}
+    })
+
+    present_days = 0.0
+    leave_days = 0
+    late_count = 0
+    total_late_minutes = 0
+    total_overtime_minutes = 0
+
+    for doc in cursor:
+        doc_date = date.fromisoformat(doc["date"])
+        is_weekday = doc_date.weekday() < 5
+        st = doc.get("status")
+
+        if st in ["PRESENT", "WFH", "ON_DUTY"]:
+            if is_weekday:
+                present_days += 0.5 if doc.get("half_day") else 1.0
+
+        if st == "LEAVE":
+            leave_days += 1
+
+        lm = doc.get("late_minutes", 0) or 0
+        if lm > 0:
+            late_count += 1
+            total_late_minutes += lm
+
+        ot = doc.get("overtime_minutes", 0) or 0
+        total_overtime_minutes += ot
+
+    attendance_pct = (
+        round_half_up((present_days / working_days) * 100, 2)
+        if working_days > 0
+        else None
+    )
+
+    return {
+        "emp_code": emp_code,
+        "month": month,
+        "working_days": working_days,
+        "present_days": present_days,
+        "leave_days": leave_days,
+        "late_count": late_count,
+        "total_late_minutes": total_late_minutes,
+        "total_overtime_minutes": total_overtime_minutes,
+        "attendance_pct": attendance_pct
+    }
+
+
+@app.get("/analytics/departments/summary", tags=["analytics"])
+def department_summary(
+    month: Annotated[str, Query(pattern=r"^\d{4}-(0[1-9]|1[0-2])$")],
+    department: Optional[str] = None
+):
+    """Department summary for a month."""
+    start_date, end_date, _ = get_month_days_range(month)
+
+    emp_q: Dict[str, Any] = {"joined_on": {"$lte": end_date}}
+    if department is not None:
+        emp_q["department"] = department
+
+    emp_cursor = db.employees.find(emp_q, {"emp_code": 1, "department": 1})
+    emp_map = {}
+    dept_headcounts: Dict[str, int] = {}
+    for e in emp_cursor:
+        emp_map[e["emp_code"]] = e["department"]
+        dept_headcounts[e["department"]] = dept_headcounts.get(e["department"], 0) + 1
+
+    if not dept_headcounts:
+        return {"month": month, "items": []}
+
+    log_match: Dict[str, Any] = {"date": {"$gte": start_date, "$lte": end_date}}
+    if department is not None:
+        log_match["emp_code"] = {"$in": list(emp_map.keys())}
+
+    logs_cursor = db.attendance_logs.find(log_match)
+
+    dept_stats: Dict[str, dict] = {}
+    for d_name in dept_headcounts:
+        dept_stats[d_name] = {
+            "present_days": 0.0,
+            "work_hours_list": [],
+            "late_count": 0,
+            "total_late_minutes": 0,
+            "leave_count": 0,
+            "on_duty_count": 0
+        }
+
+    for log in logs_cursor:
+        ecode = log.get("emp_code")
+        d_name = emp_map.get(ecode)
+        if not d_name or d_name not in dept_stats:
+            continue
+
+        st = log.get("status")
+        doc_date = date.fromisoformat(log["date"])
+        is_weekday = doc_date.weekday() < 5
+
+        if st in ["PRESENT", "WFH", "ON_DUTY"]:
+            if is_weekday:
+                dept_stats[d_name]["present_days"] += 0.5 if log.get("half_day") else 1.0
+            if log.get("work_hours") is not None:
+                dept_stats[d_name]["work_hours_list"].append(log["work_hours"])
+
+        if st == "LEAVE":
+            dept_stats[d_name]["leave_count"] += 1
+        elif st == "ON_DUTY":
+            dept_stats[d_name]["on_duty_count"] += 1
+
+        lm = log.get("late_minutes", 0) or 0
+        if lm > 0:
+            dept_stats[d_name]["late_count"] += 1
+            dept_stats[d_name]["total_late_minutes"] += lm
+
+    items = []
+    for d_name in sorted(dept_headcounts.keys()):
+        stats = dept_stats[d_name]
+        wh_list = stats["work_hours_list"]
+        avg_wh = round_half_up(sum(wh_list) / len(wh_list), 2) if wh_list else None
+        items.append({
+            "department": d_name,
+            "headcount": dept_headcounts[d_name],
+            "present_days": stats["present_days"],
+            "avg_work_hours": avg_wh,
+            "late_count": stats["late_count"],
+            "total_late_minutes": stats["total_late_minutes"],
+            "leave_count": stats["leave_count"],
+            "on_duty_count": stats["on_duty_count"]
+        })
+
+    return {"month": month, "items": items}
+
+
+@app.get("/analytics/leaderboard/late", tags=["analytics"])
+def late_leaderboard(
+    month: Annotated[str, Query(pattern=r"^\d{4}-(0[1-9]|1[0-2])$")],
+    limit: Annotated[int, Query(ge=1, le=50)] = 10,
+    department: Optional[str] = None
+):
+    """Late-comers leaderboard for a month using standard competition ranking."""
+    start_date, end_date, _ = get_month_days_range(month)
+
+    pipeline: List[Dict[str, Any]] = [
+        {"$match": {
+            "date": {"$gte": start_date, "$lte": end_date},
+            "late_minutes": {"$gt": 0}
+        }},
+        {"$group": {
+            "_id": "$emp_code",
+            "total_late_minutes": {"$sum": "$late_minutes"},
+            "late_count": {"$sum": 1}
+        }},
+        {"$lookup": {
+            "from": "employees",
+            "localField": "_id",
+            "foreignField": "emp_code",
+            "as": "emp"
+        }},
+        {"$unwind": "$emp"}
+    ]
+
+    if department is not None:
+        pipeline.append({"$match": {"emp.department": department}})
+
+    pipeline.append({"$sort": {"total_late_minutes": -1, "_id": 1}})
+
+    results = list(db.attendance_logs.aggregate(pipeline))
+
+    ranked_items = []
+    for i, r in enumerate(results):
+        if i > 0 and r["total_late_minutes"] == results[i - 1]["total_late_minutes"]:
+            rank = ranked_items[i - 1]["rank"]
+        else:
+            rank = i + 1
+
+        if rank <= limit:
+            ranked_items.append({
+                "rank": rank,
+                "emp_code": r["_id"],
+                "name": r["emp"]["name"],
+                "department": r["emp"]["department"],
+                "total_late_minutes": r["total_late_minutes"],
+                "late_count": r["late_count"]
+            })
+
+    return {"month": month, "items": ranked_items}
+
+
+@app.get("/analytics/departments/{department}/trend", tags=["analytics"])
+def department_trend(
+    department: Annotated[str, Path()],
+    from_date_str: Annotated[str, Query(alias="from")],
+    to_date_str: Annotated[str, Query(alias="to")]
+):
+    """Daily attendance trend for a department."""
+    try:
+        from_d = date.fromisoformat(from_date_str)
+        to_d = date.fromisoformat(to_date_str)
+    except ValueError:
+        raise HTTPException(status_code=422, detail="Invalid date format, expected YYYY-MM-DD")
+
+    if to_d < from_d:
+        raise HTTPException(status_code=422, detail="to cannot be earlier than from")
+
+    num_days = (to_d - from_d).days + 1
+    if num_days > 92:
+        raise HTTPException(status_code=422, detail="date range exceeds 92 days")
+
+    dept_emps = list(db.employees.find({"department": department}, {"emp_code": 1, "joined_on": 1}))
+    if not dept_emps:
+        raise HTTPException(status_code=404, detail="Department not found")
+
+    from_dt = datetime(from_d.year, from_d.month, from_d.day, tzinfo=timezone.utc)
+    to_dt = datetime(to_d.year, to_d.month, to_d.day, tzinfo=timezone.utc) + timedelta(days=1)
+
+    pipeline = [
+        {"$match": {
+            "date": {"$gte": from_date_str, "$lte": to_date_str}
+        }},
+        {"$lookup": {
+            "from": "employees",
+            "localField": "emp_code",
+            "foreignField": "emp_code",
+            "as": "emp"
+        }},
+        {"$unwind": "$emp"},
+        {"$match": {"emp.department": department}},
+        {"$project": {
+            "date_dt": {"$dateFromString": {"dateString": "$date"}},
+            "status": 1,
+            "half_day": 1,
+            "late_minutes": 1
+        }},
+        {"$group": {
+            "_id": "$date_dt",
+            "present_count": {
+                "$sum": {
+                    "$cond": [
+                        {"$in": ["$status", ["PRESENT", "WFH", "ON_DUTY"]]},
+                        {"$cond": ["$half_day", 0.5, 1.0]},
+                        0.0
+                    ]
+                }
+            },
+            "late_count": {
+                "$sum": {
+                    "$cond": [{"$gt": ["$late_minutes", 0]}, 1, 0]
+                }
+            }
+        }},
+        {"$densify": {
+            "field": "_id",
+            "range": {
+                "step": 1,
+                "unit": "day",
+                "bounds": [from_dt, to_dt]
+            }
+        }},
+        {"$sort": {"_id": 1}}
+    ]
+
+    densified_rows = list(db.attendance_logs.aggregate(pipeline))
+
+    row_dict = {}
+    for r in densified_rows:
+        dt_val = r.get("_id")
+        if isinstance(dt_val, datetime):
+            d_str = dt_val.strftime("%Y-%m-%d")
+            row_dict[d_str] = {
+                "present_count": float(r.get("present_count", 0.0) or 0.0),
+                "late_count": int(r.get("late_count", 0) or 0)
+            }
+
+    items = []
+    cur_d = from_d
+    while cur_d <= to_d:
+        d_str = cur_d.isoformat()
+        is_working_day = cur_d.weekday() < 5
+        hc = sum(1 for e in dept_emps if e["joined_on"] <= d_str)
+
+        data = row_dict.get(d_str, {"present_count": 0.0, "late_count": 0})
+        p_count = data["present_count"]
+        l_count = data["late_count"]
+
+        if is_working_day and hc > 0:
+            rate = round_half_up(p_count / hc, 4)
+        else:
+            rate = None
+
+        items.append({
+            "date": d_str,
+            "is_working_day": is_working_day,
+            "headcount": hc,
+            "present_count": p_count,
+            "late_count": l_count,
+            "attendance_rate": rate,
+            "moving_avg_7d": None
+        })
+        cur_d += timedelta(days=1)
+
+    for i in range(len(items)):
+        start_idx = max(0, i - 6)
+        window_rates = [
+            items[j]["attendance_rate"]
+            for j in range(start_idx, i + 1)
+            if items[j]["attendance_rate"] is not None
+        ]
+        if window_rates:
+            items[i]["moving_avg_7d"] = round_half_up(sum(window_rates) / len(window_rates), 4)
+        else:
+            items[i]["moving_avg_7d"] = None
+
+    return {"department": department, "items": items}
+
+
+@app.get("/admin/explain/{endpoint}", tags=["admin"])
+def explain_endpoint(
+    endpoint: Annotated[Literal["attendance_list", "employee_monthly", "department_summary", "late_leaderboard", "department_trend"], Path()],
+    emp_code: Optional[str] = None,
+    month: Optional[str] = Query(None, pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
+    department: Optional[str] = None,
+    limit: Annotated[int, Query(ge=1, le=50)] = 10,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    status: Optional[AllStatus] = None,
+    from_date_str: Optional[str] = Query(None, alias="from"),
+    to_date_str: Optional[str] = Query(None, alias="to"),
+    page: Annotated[int, Query(ge=1)] = 1,
+    page_size: Annotated[int, Query(ge=1, le=100)] = 20
+):
+    """MongoDB explain for an endpoint's main query or aggregation."""
+    if endpoint == "attendance_list":
+        if date_from and date_to and date_from > date_to:
+            raise HTTPException(status_code=422, detail="date_from cannot be greater than date_to")
+        q: Dict[str, Any] = {}
+        if emp_code is not None:
+            q["emp_code"] = emp_code
+        if date_from or date_to:
+            q["date"] = {}
+            if date_from:
+                q["date"]["$gte"] = date_from
+            if date_to:
+                q["date"]["$lte"] = date_to
+        if status is not None:
+            q["status"] = status
+        skip = (page - 1) * page_size
+        explain_res = db.command({
+            "explain": {
+                "find": "attendance_logs",
+                "filter": q,
+                "sort": {"date": -1, "emp_code": 1},
+                "skip": skip,
+                "limit": page_size
+            },
+            "verbosity": "executionStats"
+        })
+        return {
+            "endpoint": endpoint,
+            "collection": "attendance_logs",
+            "explain": jsonable_encoder(explain_res)
+        }
+
+    elif endpoint == "employee_monthly":
+        if not emp_code or not month:
+            raise HTTPException(status_code=422, detail="emp_code and month are required")
+        start_date, end_date, _ = get_month_days_range(month)
+        explain_res = db.command({
+            "explain": {
+                "find": "attendance_logs",
+                "filter": {
+                    "emp_code": emp_code,
+                    "date": {"$gte": start_date, "$lte": end_date}
+                }
+            },
+            "verbosity": "executionStats"
+        })
+        return {
+            "endpoint": endpoint,
+            "collection": "attendance_logs",
+            "explain": jsonable_encoder(explain_res)
+        }
+
+    elif endpoint == "department_summary":
+        if not month:
+            raise HTTPException(status_code=422, detail="month is required")
+        start_date, end_date, _ = get_month_days_range(month)
+        match_q: Dict[str, Any] = {"date": {"$gte": start_date, "$lte": end_date}}
+        if department is not None:
+            emp_codes = [e["emp_code"] for e in db.employees.find({"department": department}, {"emp_code": 1})]
+            match_q["emp_code"] = {"$in": emp_codes}
+        pipeline = [
+            {"$match": match_q},
+            {"$group": {"_id": "$emp_code"}}
+        ]
+        explain_res = db.command({
+            "explain": {
+                "aggregate": "attendance_logs",
+                "pipeline": pipeline,
+                "cursor": {}
+            },
+            "verbosity": "executionStats"
+        })
+        return {
+            "endpoint": endpoint,
+            "collection": "attendance_logs",
+            "explain": jsonable_encoder(explain_res)
+        }
+
+    elif endpoint == "late_leaderboard":
+        if not month:
+            raise HTTPException(status_code=422, detail="month is required")
+        start_date, end_date, _ = get_month_days_range(month)
+        pipeline = [
+            {"$match": {
+                "date": {"$gte": start_date, "$lte": end_date},
+                "late_minutes": {"$gt": 0}
+            }},
+            {"$group": {
+                "_id": "$emp_code",
+                "total_late_minutes": {"$sum": "$late_minutes"},
+                "late_count": {"$sum": 1}
+            }},
+            {"$sort": {"total_late_minutes": -1, "_id": 1}}
+        ]
+        explain_res = db.command({
+            "explain": {
+                "aggregate": "attendance_logs",
+                "pipeline": pipeline,
+                "cursor": {}
+            },
+            "verbosity": "executionStats"
+        })
+        return {
+            "endpoint": endpoint,
+            "collection": "attendance_logs",
+            "explain": jsonable_encoder(explain_res)
+        }
+
+    elif endpoint == "department_trend":
+        if not department or not from_date_str or not to_date_str:
+            raise HTTPException(status_code=422, detail="department, from, and to are required")
+        try:
+            from_d = date.fromisoformat(from_date_str)
+            to_d = date.fromisoformat(to_date_str)
+        except ValueError:
+            raise HTTPException(status_code=422, detail="Invalid date format, expected YYYY-MM-DD")
+        if to_d < from_d:
+            raise HTTPException(status_code=422, detail="to cannot be earlier than from")
+        if (to_d - from_d).days + 1 > 92:
+            raise HTTPException(status_code=422, detail="date range exceeds 92 days")
+
+        pipeline = [
+            {"$match": {
+                "date": {"$gte": from_date_str, "$lte": to_date_str}
+            }}
+        ]
+        explain_res = db.command({
+            "explain": {
+                "aggregate": "attendance_logs",
+                "pipeline": pipeline,
+                "cursor": {}
+            },
+            "verbosity": "executionStats"
+        })
+        return {
+            "endpoint": endpoint,
+            "collection": "attendance_logs",
+            "explain": jsonable_encoder(explain_res)
+        }
